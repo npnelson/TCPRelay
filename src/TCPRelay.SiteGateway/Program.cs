@@ -6,15 +6,22 @@
     using System.Buffers;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
-    using System.Net;
-    using System.Threading;
+using System.IO.Pipelines;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.AspNetCore.Connections;
-    using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
-    using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Http.Connections.Client;
+using Microsoft.AspNetCore.Http.Connections.Client.Internal;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
     using Microsoft.Extensions.Options;
+using Pipelines.Sockets.Unofficial;
 
-    namespace TCPRelay.SiteGateway
+namespace TCPRelay.SiteGateway
     {
         public class Program
         {
@@ -28,6 +35,7 @@
                     logging.SetMinimumLevel(LogLevel.Trace);
                 });
 
+            RunWebSockets(loggerFactory);
                 var logger = loggerFactory.CreateLogger<Program>();
 
                 var listenerFactory = new SocketTransportFactory(Options.Create(options), loggerFactory);
@@ -48,7 +56,7 @@
                 };
 
                 // Bind to a random port
-                var listener = await listenerFactory.BindAsync(new IPEndPoint(IPAddress.Loopback, 0));
+                var listener = await listenerFactory.BindAsync(new IPEndPoint(IPAddress.Loopback, 5002));
 
                 logger.LogInformation("Listening on {EndPoint}", listener.EndPoint);
 
@@ -123,14 +131,35 @@
                     logger.LogInformation("Accepted new connection {ConnectionId} from {RemoteEndPoint}", connection.ConnectionId, connection.RemoteEndPoint);
 
 
+
+                #region Establish WebSocket
+                var connectionOptions = new HttpConnectionOptions();
+                connectionOptions.Url = new Uri("http://localhost:5000/ws/sender");
+                connectionOptions.DefaultTransferFormat = TransferFormat.Binary;
+                connectionOptions.Transports = Microsoft.AspNetCore.Http.Connections.HttpTransportType.WebSockets;
                 
-                    try
-                    {
+
+                var webSocket = new WebSocketsTransport(connectionOptions, loggerFactory, null);
+                #endregion
+
+                try
+                {
+                    await webSocket.StartAsync(connectionOptions.Url, TransferFormat.Binary);
+                }
+                catch (Exception ex )
+                {
+                    logger.LogError(ex, "Exception thrown while attempting to start web socket");
+                    throw ;
+                }
+                try
+                {
                     
                         var input = connection.Transport.Input;
-                        var output = connection.Transport.Output;
+                        var output = webSocket.Output;
 
-                        await input.CopyToAsync(output, cancellationToken);
+                        var t1= input.CopyToAsync(output, cancellationToken);
+                    var t2 = webSocket.Input.CopyToAsync(connection.Transport.Output, cancellationToken);
+                    await Task.WhenAny(t1, t2);
                     }
                     catch (OperationCanceledException)
                     {
@@ -146,7 +175,105 @@
                     }
                 }
             }
+        private static async Task RunWebSockets(ILoggerFactory loggerFactory)
+        {
+            //    var client = new ClientWebSocket();
+
+            var hostEntry = Dns.GetHostEntry("localhost");
+            var ipe = new IPEndPoint(hostEntry.AddressList.Single(x => x.AddressFamily == AddressFamily.InterNetwork), 5005);
+            var socket = await SocketConnection.ConnectAsync(ipe);
+
+            var connectionOptions = new HttpConnectionOptions();
+            connectionOptions.Url = new Uri("http://localhost:5000/ws/receiver");
+            connectionOptions.DefaultTransferFormat = TransferFormat.Binary;
+            connectionOptions.Transports = Microsoft.AspNetCore.Http.Connections.HttpTransportType.WebSockets;
+            var serviceCollection = new ServiceCollection();
+            serviceCollection.AddLogging(builder => builder.AddConsole());
+            var serviceProvider = serviceCollection.BuildServiceProvider();
+           
+
+            var webSocket = new WebSocketsTransport(connectionOptions, loggerFactory, null);
+
+
+            try
+            {
+                await webSocket.StartAsync(connectionOptions.Url, TransferFormat.Binary);
+                //   var shutdown = new TaskCompletionSource<object>();
+                var inputTask= webSocket.Input.CopyToAsync(socket.Output);
+                var outputTask = socket.Input.CopyToAsync(webSocket.Output);
+                await Task.WhenAny(inputTask, outputTask);
+             //   _ = SendLoop(webSocket.Input, null);
+               //_ = ReceiveLoop(webSocket.Output, socket.Input);
+              //  await shutdown.Task;
+            }
+            catch (Exception ex)
+            {
+                throw ex;
+            }
+            finally
+            {
+
+                await webSocket.StopAsync();
+               // socket.Dispose();
+            }
+            //      await client.ConnectAsync(new Uri("ws://localhost:5000/ws"), CancellationToken.None);
+            Console.WriteLine("Receiver Connected!");
+
+            //initiate Tcp Connection to HL7 on localhost:5005
+
+
+
+            // socket.
+
+
+            //  await Receiving(client);
+
+
         }
+        private static async Task ReceiveLoop(PipeWriter output, PipeReader input)
+        {
+            while (true)
+            {
+                var result = await input.ReadAsync();
+                var buffer = result.Buffer;
+
+                try
+                {
+                    if (!buffer.IsEmpty)
+                    {
+                        foreach (var seg in buffer)
+                        {
+                            await output.WriteAsync(seg);
+                        }
+                    }
+                    else if (result.IsCompleted)
+                    {
+                        // No more data, and the pipe is complete
+                        break;
+                    }
+                }
+                finally
+                {
+                    input.AdvanceTo(buffer.End);
+                }
+            }
+        }
+
+        private static async Task SendLoop(PipeReader input, PipeWriter output)
+        {
+            while (true)
+            {
+                var result = await input.ReadAsync();
+                foreach (var seg in result.Buffer)
+                {
+                    //  await output.WriteAsync(seg);
+                    Console.WriteLine(System.Text.Encoding.ASCII.GetString(seg.ToArray()));
+                    
+                }
+
+            }
+        }
+    }
 
         public static class TaskExtensions
         {
